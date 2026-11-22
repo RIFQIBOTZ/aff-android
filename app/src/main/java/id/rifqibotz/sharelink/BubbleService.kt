@@ -1,5 +1,8 @@
 package id.rifqibotz.sharelink
 
+import android.animation.ObjectAnimator
+import android.animation.TimeInterpolator
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
@@ -13,19 +16,28 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
 import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.animation.AccelerateInterpolator
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -37,14 +49,20 @@ import kotlin.math.abs
 const val APP_URL = "https://rifqibotz.github.io/aff/"
 
 private val LIME = 0xFFB8FF3A.toInt()
+private val MINT = 0xFF2CF5B0.toInt()
 private val AMBER = 0xFFFFB23A.toInt()
+private val ORANGE = 0xFFFF8A3A.toInt()
 private val GRAY = 0xFF8A99A8.toInt()
 private val INK = 0xFF050D0B.toInt()
+private val SOFT = 0xFF1B2A25.toInt()
 private val METHODS = listOf(
     Triple("manual", "Manual", 0xFF8FA4BB.toInt()),
     Triple("gpt", "GPT", 0xFF34B79A.toInt()),
     Triple("claude", "Claude", 0xFFE5A83B.toInt())
 )
+private const val PANEL_DP = 272
+private const val CODE_STATE =
+    "(function(){try{var t=window.trackerAPI;return t?t.state():null}catch(e){return null}})()"
 
 /**
  * Gelembung melayang. Logika timer dan data tetap di JS tracker: service ini menjalankan
@@ -85,14 +103,21 @@ class BubbleService : Service() {
     private lateinit var tvStatus: TextView
     private lateinit var btnMain: Button
     private lateinit var btnStop: Button
+    private lateinit var btnUndo: Button
     private val methodBtns = LinkedHashMap<String, Button>()
 
     private var st: JSONObject? = null
+    private var stAt = 0L
+    private var misses = 0
     private var mode = 0
     private var panelShown = false
+    private var panelAttached = false
     private var onRight = true
     private var stopArmed = false
     private var ready = false
+    private var flash = 0
+    private var outsideClosedAt = 0L
+    private var xAnim: ValueAnimator? = null
     private var screenW = 0
     private var screenH = 0
     private var dp = 1f
@@ -101,9 +126,24 @@ class BubbleService : Service() {
     private fun d(v: Int) = (v * dp).toInt()
 
     private val hideTask = Runnable { hidePanel(); setMode(0) }
+    private val tick = object : Runnable {
+        override fun run() {
+            if (panelShown) {
+                tvTime.text = fmt(liveElapsed())
+                ui.postDelayed(this, 250)
+            }
+        }
+    }
     private val poll = object : Runnable {
         override fun run() {
-            js("window.trackerAPI?window.trackerAPI.state():null")
+            engine.evaluateJavascript(CODE_STATE) { v ->
+                if (v == null || v == "null") {
+                    if (++misses >= 4 && st != null) { st = null; render() }
+                } else {
+                    misses = 0
+                    applyState(v)
+                }
+            }
             ui.postDelayed(this, 1000)
         }
     }
@@ -142,13 +182,14 @@ class BubbleService : Service() {
         super.onConfigurationChanged(newConfig)
         if (!ready) return
         measureScreen()
-        hidePanel()
+        hidePanel(false)
         setMode(0)
     }
 
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
-        runCatching { if (panelShown) wm.removeView(panel) }
+        xAnim?.cancel()
+        runCatching { if (panelAttached) wm.removeView(panel) }
         runCatching { wm.removeView(bubble) }
         runCatching { wm.removeView(engine); engine.destroy() }
         if (instance === this) instance = null
@@ -160,7 +201,7 @@ class BubbleService : Service() {
         if (!ready) return
         ui.removeCallbacks(hideTask)
         if (fg) {
-            hidePanel()
+            hidePanel(false)
             bubble.visibility = View.GONE
         } else {
             bubble.visibility = View.VISIBLE
@@ -188,7 +229,6 @@ class BubbleService : Service() {
         startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
     }
 
-    @Suppress("DEPRECATION")
     private fun measureScreen() {
         val m = resources.displayMetrics
         screenW = m.widthPixels
@@ -213,20 +253,55 @@ class BubbleService : Service() {
         engine.loadUrl(APP_URL)
     }
 
-    private fun js(code: String) = engine.evaluateJavascript(code) { applyState(it) }
-
     private fun call(fn: String) {
         dirty = true
-        js("window.trackerAPI?window.trackerAPI.$fn:null")
+        engine.evaluateJavascript(
+            "(function(){try{var t=window.trackerAPI;return t?t.$fn:null}catch(e){return null}})()"
+        ) { v ->
+            if (v != null && v != "null") { misses = 0; applyState(v) }
+        }
     }
 
-    private fun applyState(v: String?) {
-        st = try {
-            if (v == null || v == "null") null else JSONObject(v)
-        } catch (e: Exception) {
-            null
-        }
+    private fun applyState(v: String) {
+        st = try { JSONObject(v) } catch (e: Exception) { null }
+        stAt = SystemClock.elapsedRealtime()
         render()
+    }
+
+    private fun liveElapsed(): Long {
+        val s = st ?: return 0L
+        val e = s.optLong("elapsed")
+        return if (s.optBoolean("running")) e + (SystemClock.elapsedRealtime() - stAt) else e
+    }
+
+    // ---------- animasi ----------
+    private fun moveX(to: Int, ms: Long = 260L, interp: TimeInterpolator = DecelerateInterpolator(2.2f)) {
+        xAnim?.cancel()
+        val from = bubbleLp.x
+        if (from == to) { runCatching { wm.updateViewLayout(bubble, bubbleLp) }; return }
+        xAnim = ValueAnimator.ofInt(from, to).apply {
+            duration = ms
+            interpolator = interp
+            addUpdateListener {
+                bubbleLp.x = it.animatedValue as Int
+                runCatching { wm.updateViewLayout(bubble, bubbleLp) }
+            }
+            start()
+        }
+    }
+
+    private fun pulse() {
+        bubble.animate().cancel()
+        bubble.animate().scaleX(1.22f).scaleY(1.22f).setDuration(90).setInterpolator(DecelerateInterpolator())
+            .withEndAction {
+                bubble.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(OvershootInterpolator(3f)).start()
+            }.start()
+    }
+
+    private fun flashRing(color: Int) {
+        flash = color
+        render()
+        ui.postDelayed({ flash = 0; render() }, 450)
     }
 
     // ---------- bubble ----------
@@ -234,8 +309,8 @@ class BubbleService : Service() {
     private fun buildBubble() {
         bubble = TextView(themed).apply {
             gravity = Gravity.CENTER
-            textSize = 17f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = 18f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             setTextColor(Color.WHITE)
             text = "…"
         }
@@ -247,6 +322,7 @@ class BubbleService : Service() {
         val p = prefs(this)
         onRight = p.getBoolean("right", true)
         bubbleLp.y = p.getInt("y", d(320))
+        bubbleLp.x = targetX()
 
         bubble.setOnTouchListener(object : View.OnTouchListener {
             var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
@@ -254,6 +330,9 @@ class BubbleService : Service() {
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
                         sx = e.rawX; sy = e.rawY; ox = bubbleLp.x; oy = bubbleLp.y; moved = false
+                        xAnim?.cancel()
+                        bubble.animate().cancel()
+                        bubble.animate().scaleX(0.9f).scaleY(0.9f).setDuration(80).setInterpolator(DecelerateInterpolator()).start()
                         return true
                     }
                     MotionEvent.ACTION_MOVE -> {
@@ -263,7 +342,7 @@ class BubbleService : Service() {
                             moved = true
                             hidePanel()
                             mode = 1
-                            bubble.alpha = 1f
+                            ObjectAnimator.ofFloat(bubble, View.ALPHA, 1f).setDuration(120).start()
                         }
                         if (moved) {
                             bubbleLp.x = (ox + dx).toInt()
@@ -272,13 +351,14 @@ class BubbleService : Service() {
                         }
                         return true
                     }
-                    MotionEvent.ACTION_UP -> {
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        bubble.animate().scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(OvershootInterpolator(2.5f)).start()
                         if (moved) {
                             onRight = e.rawX > screenW / 2
                             prefs(this@BubbleService).edit().putBoolean("right", onRight).putInt("y", bubbleLp.y).apply()
                             setMode(1)
                             scheduleHide()
-                        } else {
+                        } else if (e.action == MotionEvent.ACTION_UP) {
                             onTap()
                         }
                         return true
@@ -294,52 +374,77 @@ class BubbleService : Service() {
     private fun onTap() {
         when (mode) {
             0 -> { setMode(1); scheduleHide() }
-            1 -> showPanel()
+            1 -> if (SystemClock.uptimeMillis() - outsideClosedAt < 500) scheduleHide() else showPanel()
             else -> { hidePanel(); setMode(1); scheduleHide() }
         }
     }
 
     private fun setMode(m: Int) {
         mode = m
-        bubble.alpha = if (m == 0) 0.5f else 1f
+        ObjectAnimator.ofFloat(bubble, View.ALPHA, if (m == 0) 0.5f else 1f).setDuration(200).start()
         applyPos()
     }
 
-    private fun applyPos() {
-        bubbleLp.x = if (mode == 0) {
-            if (onRight) screenW - size / 2 else -size / 2
-        } else {
-            if (onRight) screenW - size - d(6) else d(6)
-        }
+    private fun targetX(): Int =
+        if (mode == 0) { if (onRight) screenW - size / 2 else -size / 2 }
+        else { if (onRight) screenW - size - d(6) else d(6) }
+
+    private fun applyPos(animate: Boolean = true) {
         bubbleLp.y = bubbleLp.y.coerceIn(0, screenH - size)
-        runCatching { wm.updateViewLayout(bubble, bubbleLp) }
+        if (animate) moveX(targetX())
+        else {
+            xAnim?.cancel()
+            bubbleLp.x = targetX()
+            runCatching { wm.updateViewLayout(bubble, bubbleLp) }
+        }
     }
 
     private fun scheduleHide() {
         ui.removeCallbacks(hideTask)
-        ui.postDelayed(hideTask, if (mode == 2) 7000L else 4000L)
+        ui.postDelayed(hideTask, if (mode == 2) 7000L else 3500L)
     }
 
     // ---------- panel ----------
     private fun top(h: Int = ViewGroup.LayoutParams.WRAP_CONTENT) =
         LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h).apply { topMargin = d(10) }
 
-    private fun tv(sizeSp: Float, color: Int, bold: Boolean = false) = TextView(themed).apply {
-        textSize = sizeSp
-        setTextColor(color)
-        if (bold) typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    private fun grad(c1: Int, c2: Int, r: Float): Drawable =
+        GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(c1, c2)).apply { cornerRadius = r * dp }
+
+    private fun methodText(label: String, n: Int): CharSequence {
+        val sb = SpannableStringBuilder(label)
+        sb.setSpan(RelativeSizeSpan(0.85f), 0, label.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.append("\n")
+        val start = sb.length
+        sb.append(n.toString())
+        sb.setSpan(RelativeSizeSpan(1.9f), start, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.setSpan(StyleSpan(Typeface.BOLD), start, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return sb
     }
 
-    private fun btn(label: String, fill: Int, textColor: Int, onClick: () -> Unit) = Button(themed).apply {
+    @SuppressLint("ClickableViewAccessibility")
+    private fun btn(label: String, fill: Drawable, textColor: Int, onClick: () -> Unit) = Button(themed).apply {
         text = label
         isAllCaps = false
         textSize = 13f
+        typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
         setTextColor(textColor)
-        background = GradientDrawable().apply { setColor(fill); cornerRadius = 14f * dp }
+        background = fill
         stateListAnimator = null
         minHeight = 0; minimumHeight = 0; minWidth = 0; minimumWidth = 0
         setPadding(d(4), d(4), d(4), d(4))
         setOnClickListener { onClick(); scheduleHide() }
+        setOnTouchListener { v, e ->
+            if (v.isEnabled) {
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN ->
+                        v.animate().scaleX(0.94f).scaleY(0.94f).setDuration(80).setInterpolator(DecelerateInterpolator()).start()
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(200).setInterpolator(OvershootInterpolator(2.5f)).start()
+                }
+            }
+            false
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -347,19 +452,42 @@ class BubbleService : Service() {
         panel = LinearLayout(themed).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(d(14), d(12), d(14), d(14))
-            background = GradientDrawable().apply {
-                setColor(0xF2081410.toInt()); cornerRadius = 22f * dp; setStroke(d(1), 0x33FFFFFF)
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xF2102520.toInt(), 0xF2050D0B.toInt())
+            ).apply { cornerRadius = 24f * dp; setStroke(d(1), 0x33FFFFFF) }
+            // sentuhan di luar panel: tutup otomatis, sentuhannya tetap diteruskan ke app di bawah
+            setOnTouchListener { _, e ->
+                if (e.action == MotionEvent.ACTION_OUTSIDE) {
+                    outsideClosedAt = SystemClock.uptimeMillis()
+                    hidePanel()
+                    setMode(1)
+                    scheduleHide()
+                    true
+                } else {
+                    scheduleHide()
+                    false
+                }
             }
-            setOnTouchListener { _, _ -> scheduleHide(); false }
         }
-        tvTime = tv(30f, LIME, true).apply { typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) }
-        tvStatus = tv(12f, GRAY)
-        panel.addView(tvTime)
-        panel.addView(tvStatus)
+
+        val head = LinearLayout(themed).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        tvTime = TextView(themed).apply {
+            textSize = 30f
+            setTextColor(LIME)
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        }
+        tvStatus = TextView(themed).apply {
+            textSize = 11f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            setPadding(d(10), d(4), d(10), d(4))
+        }
+        head.addView(tvTime, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        head.addView(tvStatus)
+        panel.addView(head)
 
         val rowMain = LinearLayout(themed).apply { orientation = LinearLayout.HORIZONTAL }
-        btnMain = btn("Mulai", LIME, INK) { call("main()") }
-        btnStop = btn("Selesai", 0xFF2A3A34.toInt(), Color.WHITE) { onStopTap() }
+        btnMain = btn("Mulai", grad(LIME, MINT, 14f), INK) { call("main()") }
+        btnStop = btn("Selesai", grad(SOFT, SOFT, 14f), Color.WHITE) { onStopTap() }
         rowMain.addView(btnMain, LinearLayout.LayoutParams(0, d(48), 2f))
         rowMain.addView(btnStop, LinearLayout.LayoutParams(0, d(48), 1f).apply { leftMargin = d(8) })
         panel.addView(rowMain, top())
@@ -367,22 +495,33 @@ class BubbleService : Service() {
         val rowM = LinearLayout(themed).apply { orientation = LinearLayout.HORIZONTAL }
         for ((i, m) in METHODS.withIndex()) {
             val key = m.first
-            val b = btn(m.second, m.third, INK) {
+            val b = btn(m.second, grad(m.third, m.third, 16f), INK) {
                 if (st?.optBoolean("running") == true) {
                     buzz()
                     call("tap('$key')")
+                    pulse()
+                    flashRing(m.third)
                 }
             }
+            b.maxLines = 2
             methodBtns[key] = b
-            rowM.addView(b, LinearLayout.LayoutParams(0, d(64), 1f).apply { if (i > 0) leftMargin = d(8) })
+            rowM.addView(b, LinearLayout.LayoutParams(0, d(72), 1f).apply { if (i > 0) leftMargin = d(8) })
         }
         panel.addView(rowM, top())
 
-        panel.addView(btn("Visit web", 0xFF1B2A25.toInt(), Color.WHITE) { openApp() }, top(d(44)))
+        val rowBottom = LinearLayout(themed).apply { orientation = LinearLayout.HORIZONTAL }
+        btnUndo = btn("Undo", grad(SOFT, SOFT, 14f), Color.WHITE) {
+            if (st?.isNull("last") == false) { buzz(); call("undo()"); pulse() }
+        }
+        val btnWeb = btn("Visit web", grad(SOFT, SOFT, 14f), Color.WHITE) { openApp() }
+        rowBottom.addView(btnUndo, LinearLayout.LayoutParams(0, d(44), 1f))
+        rowBottom.addView(btnWeb, LinearLayout.LayoutParams(0, d(44), 1f).apply { leftMargin = d(8) })
+        panel.addView(rowBottom, top())
 
         panelLp = WindowManager.LayoutParams(
-            d(264), WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            d(PANEL_DP), WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
     }
@@ -391,22 +530,41 @@ class BubbleService : Service() {
         if (panelShown) return
         mode = 2
         panelShown = true
-        bubble.alpha = 1f
+        ObjectAnimator.ofFloat(bubble, View.ALPHA, 1f).setDuration(150).start()
         applyPos()
-        val w = d(264)
+        val w = d(PANEL_DP)
         panelLp.x = if (onRight) screenW - size - d(6) - d(8) - w else d(6) + size + d(8)
-        panelLp.y = bubbleLp.y.coerceAtMost(screenH - d(320)).coerceAtLeast(d(30))
-        wm.addView(panel, panelLp)
+        panelLp.y = bubbleLp.y.coerceAtMost(screenH - d(340)).coerceAtLeast(d(30))
+        panel.animate().cancel()
+        panel.alpha = 0f
+        panel.scaleX = 0.82f
+        panel.scaleY = 0.82f
+        panel.pivotX = if (onRight) w.toFloat() else 0f
+        panel.pivotY = (bubbleLp.y + size / 2f - panelLp.y).coerceAtLeast(0f)
+        if (panelAttached) runCatching { wm.updateViewLayout(panel, panelLp) }
+        else { wm.addView(panel, panelLp); panelAttached = true }
+        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(OvershootInterpolator(1.15f)).start()
         render()
+        ui.post(tick)
         scheduleHide()
     }
 
-    private fun hidePanel() {
-        if (panelShown) {
-            runCatching { wm.removeView(panel) }
-            panelShown = false
-        }
+    private fun hidePanel(animated: Boolean = true) {
         if (mode == 2) mode = 1
+        if (!panelShown) return
+        panelShown = false
+        ui.removeCallbacks(tick)
+        panel.animate().cancel()
+        if (!animated) { detachPanel(); return }
+        panel.animate().alpha(0f).scaleX(0.9f).scaleY(0.9f).setDuration(140).setInterpolator(AccelerateInterpolator())
+            .withEndAction { if (!panelShown) detachPanel() }.start()
+    }
+
+    private fun detachPanel() {
+        if (panelAttached) {
+            runCatching { wm.removeView(panel) }
+            panelAttached = false
+        }
     }
 
     private fun onStopTap() {
@@ -422,7 +580,7 @@ class BubbleService : Service() {
     }
 
     private fun openApp() {
-        hidePanel()
+        hidePanel(false)
         setMode(0)
         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
@@ -443,34 +601,46 @@ class BubbleService : Service() {
         val active = s?.optBoolean("active") == true
         val running = s?.optBoolean("running") == true
         val counts = s?.optJSONObject("counts")
+        val last = if (s != null && !s.isNull("last")) s.optString("last") else null
         var total = 0
         for ((key, label, _) in METHODS) {
             val n = counts?.optInt(key) ?: 0
             total += n
             methodBtns[key]?.let {
-                it.text = "$label\n$n"
+                it.text = methodText(label, n)
                 it.isEnabled = running
                 it.alpha = if (running) 1f else 0.4f
             }
         }
-        val ring = if (running) LIME else if (active) AMBER else GRAY
+        val base = if (running) LIME else if (active) AMBER else GRAY
         bubble.text = if (s == null) "…" else total.toString()
         bubble.setTextColor(if (running) LIME else Color.WHITE)
-        bubble.background = GradientDrawable().apply {
+        bubble.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xF0183029.toInt(), 0xF0050D0B.toInt())
+        ).apply {
             shape = GradientDrawable.OVAL
-            setColor(0xE6081410.toInt())
-            setStroke(d(3), ring)
+            setStroke(d(3), if (flash != 0) flash else base)
         }
-        tvTime.text = fmt(s?.optLong("elapsed") ?: 0L)
+        tvTime.text = fmt(liveElapsed())
         tvStatus.text = when {
-            s == null -> "Tracker belum siap"
+            s == null -> "Belum siap"
             !active -> "Belum jalan"
             running -> "Jalan"
             else -> "Dijeda"
         }
+        tvStatus.setTextColor(base)
+        tvStatus.background = GradientDrawable().apply {
+            setColor((base and 0x00FFFFFF) or 0x2A000000)
+            cornerRadius = 99f * dp
+        }
         btnMain.text = if (!active) "Mulai" else if (running) "Jeda" else "Lanjut"
+        btnMain.background = if (running) grad(AMBER, ORANGE, 14f) else grad(LIME, MINT, 14f)
         btnStop.text = if (stopArmed) "Yakin?" else "Selesai"
         btnStop.isEnabled = active
         btnStop.alpha = if (active) 1f else 0.4f
+        val lastLabel = METHODS.firstOrNull { it.first == last }?.second
+        btnUndo.text = if (lastLabel != null) "Undo $lastLabel" else "Undo"
+        btnUndo.isEnabled = lastLabel != null
+        btnUndo.alpha = if (lastLabel != null) 1f else 0.4f
     }
 }
