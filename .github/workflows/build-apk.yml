@@ -24,7 +24,7 @@ jobs:
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Build APK debug
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug --no-daemon -PappVersionCode=${{ github.run_number }}
 
       - uses: actions/upload-artifact@v4
         with:

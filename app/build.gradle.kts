@@ -11,7 +11,7 @@ android {
         applicationId = "id.rifqibotz.sharelink"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
+        versionCode = (project.findProperty("appVersionCode") as String?)?.toIntOrNull() ?: 1
         versionName = "1.0"
     }
     signingConfigs {

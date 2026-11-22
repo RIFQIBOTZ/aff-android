@@ -110,14 +110,14 @@ class BubbleService : Service() {
     private var stAt = 0L
     private var misses = 0
     private var mode = 0
-    private var panelShown = false
     private var panelAttached = false
     private var onRight = true
     private var stopArmed = false
     private var ready = false
     private var flash = 0
-    private var outsideClosedAt = 0L
     private var xAnim: ValueAnimator? = null
+    private var alphaAnim: ObjectAnimator? = null
+    private var outsideStamp = 0L
     private var screenW = 0
     private var screenH = 0
     private var dp = 1f
@@ -125,10 +125,10 @@ class BubbleService : Service() {
     private val size: Int get() = d(52)
     private fun d(v: Int) = (v * dp).toInt()
 
-    private val hideTask = Runnable { hidePanel(); setMode(0) }
+    private val hideTask = Runnable { go(0) }
     private val tick = object : Runnable {
         override fun run() {
-            if (panelShown) {
+            if (mode == 2) {
                 tvTime.text = fmt(liveElapsed())
                 ui.postDelayed(this, 250)
             }
@@ -175,15 +175,17 @@ class BubbleService : Service() {
         buildPanel()
         ready = true
         ui.post(poll)
-        scheduleHide()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         if (!ready) return
         measureScreen()
-        hidePanel(false)
-        setMode(0)
+        ui.removeCallbacks(hideTask)
+        closePanel(false)
+        mode = 0
+        fadeBubble(0.5f, false)
+        applyPos(false)
     }
 
     override fun onDestroy() {
@@ -201,11 +203,12 @@ class BubbleService : Service() {
         if (!ready) return
         ui.removeCallbacks(hideTask)
         if (fg) {
-            hidePanel(false)
+            closePanel(false)
+            mode = 0
             bubble.visibility = View.GONE
         } else {
             bubble.visibility = View.VISIBLE
-            setMode(0)
+            go(0, false)
             engine.reload()
         }
     }
@@ -316,19 +319,24 @@ class BubbleService : Service() {
         }
         bubbleLp = WindowManager.LayoutParams(
             size, size, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
         val p = prefs(this)
         onRight = p.getBoolean("right", true)
         bubbleLp.y = p.getInt("y", d(320))
         bubbleLp.x = targetX()
+        bubble.setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
         bubble.setOnTouchListener(object : View.OnTouchListener {
             var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+            var touching = false; var openAtDown = false
             override fun onTouch(v: View, e: MotionEvent): Boolean {
                 when (e.action) {
                     MotionEvent.ACTION_DOWN -> {
+                        touching = true
+                        openAtDown = mode == 2 || recentOutside()
                         sx = e.rawX; sy = e.rawY; ox = bubbleLp.x; oy = bubbleLp.y; moved = false
                         xAnim?.cancel()
                         bubble.animate().cancel()
@@ -340,9 +348,7 @@ class BubbleService : Service() {
                         val dy = e.rawY - sy
                         if (!moved && (abs(dx) > d(8) || abs(dy) > d(8))) {
                             moved = true
-                            hidePanel()
-                            mode = 1
-                            ObjectAnimator.ofFloat(bubble, View.ALPHA, 1f).setDuration(120).start()
+                            startDrag()
                         }
                         if (moved) {
                             bubbleLp.x = (ox + dx).toInt()
@@ -352,15 +358,20 @@ class BubbleService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        touching = false
                         bubble.animate().scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(OvershootInterpolator(2.5f)).start()
                         if (moved) {
                             onRight = e.rawX > screenW / 2
                             prefs(this@BubbleService).edit().putBoolean("right", onRight).putInt("y", bubbleLp.y).apply()
-                            setMode(1)
-                            scheduleHide()
+                            go(1)
                         } else if (e.action == MotionEvent.ACTION_UP) {
-                            onTap()
+                            onTap(openAtDown)
                         }
+                        return true
+                    }
+                    MotionEvent.ACTION_OUTSIDE -> {
+                        // bubble nonjol tanpa panel: sentuhan di luar membuatnya samar lagi
+                        if (!touching && mode == 1 && claimOutside()) go(0)
                         return true
                     }
                 }
@@ -368,21 +379,52 @@ class BubbleService : Service() {
             }
         })
         wm.addView(bubble, bubbleLp)
-        setMode(0)
+        go(0, false)
     }
 
-    private fun onTap() {
+    private fun recentOutside() = SystemClock.uptimeMillis() - outsideStamp < 150
+
+    /** Satu sentuhan di luar bisa dikirim ke bubble DAN panel; hanya satu yang boleh bertindak. */
+    private fun claimOutside(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now - outsideStamp < 150) return false
+        outsideStamp = now
+        return true
+    }
+
+    private fun onTap(openAtDown: Boolean) {
+        if (openAtDown) { go(1); return } // tap bubble saat panel terbuka: cukup tutup panel
         when (mode) {
-            0 -> { setMode(1); scheduleHide() }
-            1 -> if (SystemClock.uptimeMillis() - outsideClosedAt < 500) scheduleHide() else showPanel()
-            else -> { hidePanel(); setMode(1); scheduleHide() }
+            0 -> go(1)
+            1 -> go(2)
+            else -> go(1)
         }
     }
 
-    private fun setMode(m: Int) {
+    /** Satu-satunya pintu pindah mode: 0 = samar, 1 = nonjol, 2 = panel terbuka. */
+    private fun go(m: Int, animated: Boolean = true) {
+        ui.removeCallbacks(hideTask)
+        val prev = mode
         mode = m
-        ObjectAnimator.ofFloat(bubble, View.ALPHA, if (m == 0) 0.5f else 1f).setDuration(200).start()
-        applyPos()
+        if (prev == 2 && m != 2) closePanel(animated)
+        if (m == 2 && prev != 2) openPanel()
+        fadeBubble(if (m == 0) 0.5f else 1f, animated)
+        applyPos(animated)
+        if (m != 0) scheduleHide()
+    }
+
+    private fun startDrag() {
+        ui.removeCallbacks(hideTask)
+        xAnim?.cancel()
+        if (mode == 2) closePanel(true)
+        mode = 1
+        fadeBubble(1f)
+    }
+
+    private fun fadeBubble(to: Float, animated: Boolean = true) {
+        alphaAnim?.cancel()
+        if (!animated) { bubble.alpha = to; return }
+        alphaAnim = ObjectAnimator.ofFloat(bubble, View.ALPHA, to).apply { duration = 180; start() }
     }
 
     private fun targetX(): Int =
@@ -458,10 +500,7 @@ class BubbleService : Service() {
             // sentuhan di luar panel: tutup otomatis, sentuhannya tetap diteruskan ke app di bawah
             setOnTouchListener { _, e ->
                 if (e.action == MotionEvent.ACTION_OUTSIDE) {
-                    outsideClosedAt = SystemClock.uptimeMillis()
-                    hidePanel()
-                    setMode(1)
-                    scheduleHide()
+                    if (mode == 2 && claimOutside()) go(1)
                     true
                 } else {
                     scheduleHide()
@@ -526,12 +565,7 @@ class BubbleService : Service() {
         ).apply { gravity = Gravity.TOP or Gravity.START }
     }
 
-    private fun showPanel() {
-        if (panelShown) return
-        mode = 2
-        panelShown = true
-        ObjectAnimator.ofFloat(bubble, View.ALPHA, 1f).setDuration(150).start()
-        applyPos()
+    private fun openPanel() {
         val w = d(PANEL_DP)
         panelLp.x = if (onRight) screenW - size - d(6) - d(8) - w else d(6) + size + d(8)
         panelLp.y = bubbleLp.y.coerceAtMost(screenH - d(340)).coerceAtLeast(d(30))
@@ -543,21 +577,20 @@ class BubbleService : Service() {
         panel.pivotY = (bubbleLp.y + size / 2f - panelLp.y).coerceAtLeast(0f)
         if (panelAttached) runCatching { wm.updateViewLayout(panel, panelLp) }
         else { wm.addView(panel, panelLp); panelAttached = true }
-        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(OvershootInterpolator(1.15f)).start()
-        render()
+        renderPanel()
+        // withLayer: seluruh panel difade sebagai satu lapisan, supaya tombol dan latar tidak berkedip terpisah
+        panel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(240)
+            .setInterpolator(OvershootInterpolator(1.15f)).withLayer().start()
         ui.post(tick)
-        scheduleHide()
     }
 
-    private fun hidePanel(animated: Boolean = true) {
-        if (mode == 2) mode = 1
-        if (!panelShown) return
-        panelShown = false
+    private fun closePanel(animated: Boolean) {
         ui.removeCallbacks(tick)
         panel.animate().cancel()
-        if (!animated) { detachPanel(); return }
-        panel.animate().alpha(0f).scaleX(0.9f).scaleY(0.9f).setDuration(140).setInterpolator(AccelerateInterpolator())
-            .withEndAction { if (!panelShown) detachPanel() }.start()
+        if (!animated || !panelAttached) { detachPanel(); return }
+        panel.animate().alpha(0f).scaleX(0.9f).scaleY(0.9f).setDuration(140)
+            .setInterpolator(AccelerateInterpolator()).withLayer()
+            .withEndAction { if (mode != 2) detachPanel() }.start()
     }
 
     private fun detachPanel() {
@@ -580,8 +613,7 @@ class BubbleService : Service() {
     }
 
     private fun openApp() {
-        hidePanel(false)
-        setMode(0)
+        go(0)
         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
@@ -597,30 +629,46 @@ class BubbleService : Service() {
     }
 
     private fun render() {
+        renderBubble()
+        if (mode == 2) renderPanel()
+    }
+
+    private fun statusColor(): Int {
         val s = st
-        val active = s?.optBoolean("active") == true
+        return if (s?.optBoolean("running") == true) LIME else if (s?.optBoolean("active") == true) AMBER else GRAY
+    }
+
+    private fun renderBubble() {
+        val s = st
         val running = s?.optBoolean("running") == true
         val counts = s?.optJSONObject("counts")
-        val last = if (s != null && !s.isNull("last")) s.optString("last") else null
         var total = 0
-        for ((key, label, _) in METHODS) {
-            val n = counts?.optInt(key) ?: 0
-            total += n
-            methodBtns[key]?.let {
-                it.text = methodText(label, n)
-                it.isEnabled = running
-                it.alpha = if (running) 1f else 0.4f
-            }
-        }
-        val base = if (running) LIME else if (active) AMBER else GRAY
+        for ((key, _, _) in METHODS) total += counts?.optInt(key) ?: 0
         bubble.text = if (s == null) "…" else total.toString()
         bubble.setTextColor(if (running) LIME else Color.WHITE)
         bubble.background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xF0183029.toInt(), 0xF0050D0B.toInt())
         ).apply {
             shape = GradientDrawable.OVAL
-            setStroke(d(3), if (flash != 0) flash else base)
+            setStroke(d(3), if (flash != 0) flash else statusColor())
         }
+    }
+
+    /** Hanya dipanggil saat panel terbuka, supaya panel yang sedang menutup tidak ikut berubah ukuran. */
+    private fun renderPanel() {
+        val s = st
+        val active = s?.optBoolean("active") == true
+        val running = s?.optBoolean("running") == true
+        val counts = s?.optJSONObject("counts")
+        val last = if (s != null && !s.isNull("last")) s.optString("last") else null
+        for ((key, label, _) in METHODS) {
+            methodBtns[key]?.let {
+                it.text = methodText(label, counts?.optInt(key) ?: 0)
+                it.isEnabled = running
+                it.alpha = if (running) 1f else 0.4f
+            }
+        }
+        val base = statusColor()
         tvTime.text = fmt(liveElapsed())
         tvStatus.text = when {
             s == null -> "Belum siap"
