@@ -198,6 +198,8 @@ class BubbleService : Service() {
         super.onDestroy()
     }
 
+    fun reloadEngine() { if (ready) engine.reload() }
+
     /** Dipanggil MainActivity: sembunyikan bubble saat app dibuka, tampilkan lagi saat ditinggalkan. */
     fun onAppForeground(fg: Boolean) {
         if (!ready) return

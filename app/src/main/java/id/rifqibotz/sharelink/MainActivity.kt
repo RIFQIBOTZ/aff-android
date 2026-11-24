@@ -66,6 +66,7 @@ class MainActivity : Activity() {
         }
 
         setContentView(web)
+        web.clearCache(true) // cache HTTP saja; localStorage (data sesi) tidak tersentuh
         web.loadUrl(APP_URL)
 
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -113,6 +114,17 @@ class MainActivity : Activity() {
     inner class Bridge {
         @JavascriptInterface
         fun isBubbleEnabled(): Boolean = BubbleService.instance != null
+
+        /** Muat ulang tampilan ke versi terbaru tanpa menghapus data (localStorage tidak disentuh). */
+        @JavascriptInterface
+        fun refreshApp() {
+            runOnUiThread {
+                web.clearCache(true)
+                BubbleService.instance?.reloadEngine()
+                web.loadUrl(APP_URL)
+                Toast.makeText(this@MainActivity, "Memuat versi terbaru. Data tidak dihapus.", Toast.LENGTH_SHORT).show()
+            }
+        }
 
         @JavascriptInterface
         fun hasOverlayPermission(): Boolean = Settings.canDrawOverlays(this@MainActivity)
