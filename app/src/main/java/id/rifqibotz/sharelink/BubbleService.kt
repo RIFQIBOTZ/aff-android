@@ -58,7 +58,8 @@ private val SOFT = 0xFF1B2A25.toInt()
 private val METHODS = listOf(
     Triple("manual", "Manual", 0xFF8FA4BB.toInt()),
     Triple("gpt", "GPT", 0xFF34B79A.toInt()),
-    Triple("claude", "Claude", 0xFFE5A83B.toInt())
+    Triple("claude", "Claude", 0xFFE5A83B.toInt()),
+    Triple("koleksi", "Koleksi", 0xFFFFB23A.toInt())
 )
 private const val PANEL_DP = 272
 private const val CODE_STATE =
@@ -546,7 +547,7 @@ class BubbleService : Service() {
             }
             b.maxLines = 2
             methodBtns[key] = b
-            rowM.addView(b, LinearLayout.LayoutParams(0, d(72), 1f).apply { if (i > 0) leftMargin = d(8) })
+            rowM.addView(b, LinearLayout.LayoutParams(0, d(72), 1f).apply { if (i > 0) leftMargin = d(6) })
         }
         panel.addView(rowM, top())
 
