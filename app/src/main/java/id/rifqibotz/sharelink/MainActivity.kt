@@ -56,7 +56,10 @@ class MainActivity : Activity() {
                 fileCb?.onReceiveValue(null)
                 fileCb = filePathCallback
                 return try {
-                    startActivityForResult(fileChooserParams!!.createIntent(), 42)
+                    val intent = fileChooserParams!!.createIntent()
+                    // createIntent() tidak mengaktifkan pilih-banyak sendiri, jadi ditambahkan di sini
+                    if (fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE) intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    startActivityForResult(intent, 42)
                     true
                 } catch (e: Exception) {
                     fileCb = null
