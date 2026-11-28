@@ -19,6 +19,7 @@ Web (repo `aff`) tetap menjadi satu-satunya sumber logika: timer, data sesi, imp
 - **Ekspor JSON ke folder Download** (unduhan blob biasa tidak jalan di WebView, jadi disediakan lewat bridge).
 - **Cek pembaruan** di tab Setelan: memuat ulang versi web terbaru tanpa menghapus data.
 - **Update APK menimpa versi lama tanpa uninstall** (kunci tanda tangan tetap).
+- **Tampilan**: warna tombol metode sama dengan web, ikon adaptif, ikon notifikasi mata rantai, latar peluncuran gelap, dan gelembung terbaca TalkBack ("Gelembung sharelink, N sharelink, timer jalan").
 
 ## Cara kerja
 
@@ -56,7 +57,7 @@ aff-android/
 │       ├── java/id/rifqibotz/sharelink/
 │       │   ├── MainActivity.kt          # WebView layar penuh, JS bridge, pemilih file
 │       │   └── BubbleService.kt         # gelembung, panel, engine WebView
-│       └── res/mipmap-xxxhdpi/ic_launcher.png
+│       └── res/                         # ikon adaptif, ikon notifikasi, tema, warna
 ├── build.gradle.kts
 ├── settings.gradle.kts
 └── gradle.properties

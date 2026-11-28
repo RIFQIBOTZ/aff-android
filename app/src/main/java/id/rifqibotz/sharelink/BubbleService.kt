@@ -55,10 +55,11 @@ private val ORANGE = 0xFFFF8A3A.toInt()
 private val GRAY = 0xFF8A99A8.toInt()
 private val INK = 0xFF050D0B.toInt()
 private val SOFT = 0xFF1B2A25.toInt()
+// Warna metode sama dengan web (sky, lime, pink, amber). Palet lama: Claude dan Koleksi nyaris identik (jarak RGB 28 dari 441).
 private val METHODS = listOf(
-    Triple("manual", "Manual", 0xFF8FA4BB.toInt()),
-    Triple("gpt", "GPT", 0xFF34B79A.toInt()),
-    Triple("claude", "Claude", 0xFFE5A83B.toInt()),
+    Triple("manual", "Manual", 0xFF52D6FF.toInt()),
+    Triple("gpt", "GPT", 0xFFB8FF3A.toInt()),
+    Triple("claude", "Claude", 0xFFFF4D96.toInt()),
     Triple("koleksi", "Koleksi", 0xFFFFB23A.toInt())
 )
 private const val PANEL_DP = 272
@@ -145,7 +146,8 @@ class BubbleService : Service() {
                     applyState(v)
                 }
             }
-            ui.postDelayed(this, 1000)
+            // panel terbuka: 1 dtk (timer terlihat); tertutup: 2 dtk, hanya angka gelembung yang perlu diperbarui
+            ui.postDelayed(this, if (mode == 2) 1000L else 2000L)
         }
     }
 
@@ -225,7 +227,7 @@ class BubbleService : Service() {
         )
         val openPi = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val n = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ic_stat_link)
             .setContentTitle("Gelembung sharelink aktif")
             .setContentText("Ketuk untuk membuka tracker")
             .setContentIntent(openPi)
@@ -381,6 +383,8 @@ class BubbleService : Service() {
                 return false
             }
         })
+        // jalur aksesibilitas: TalkBack memicu klik, sentuhan biasa tetap lewat OnTouchListener di atas
+        bubble.setOnClickListener { onTap(false) }
         wm.addView(bubble, bubbleLp)
         go(0, false)
     }
@@ -458,7 +462,7 @@ class BubbleService : Service() {
 
     private fun methodText(label: String, n: Int): CharSequence {
         val sb = SpannableStringBuilder(label)
-        sb.setSpan(RelativeSizeSpan(0.85f), 0, label.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.setSpan(RelativeSizeSpan(0.92f), 0, label.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         sb.append("\n")
         val start = sb.length
         sb.append(n.toString())
@@ -519,7 +523,7 @@ class BubbleService : Service() {
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         }
         tvStatus = TextView(themed).apply {
-            textSize = 11f
+            textSize = 12f
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             setPadding(d(10), d(4), d(10), d(4))
         }
@@ -556,8 +560,8 @@ class BubbleService : Service() {
             if (st?.isNull("last") == false) { buzz(); call("undo()"); pulse() }
         }
         val btnWeb = btn("Visit web", grad(SOFT, SOFT, 14f), Color.WHITE) { openApp() }
-        rowBottom.addView(btnUndo, LinearLayout.LayoutParams(0, d(44), 1f))
-        rowBottom.addView(btnWeb, LinearLayout.LayoutParams(0, d(44), 1f).apply { leftMargin = d(8) })
+        rowBottom.addView(btnUndo, LinearLayout.LayoutParams(0, d(48), 1f))
+        rowBottom.addView(btnWeb, LinearLayout.LayoutParams(0, d(48), 1f).apply { leftMargin = d(8) })
         panel.addView(rowBottom, top())
 
         panelLp = WindowManager.LayoutParams(
@@ -648,6 +652,8 @@ class BubbleService : Service() {
         var total = 0
         for ((key, _, _) in METHODS) total += counts?.optInt(key) ?: 0
         bubble.text = if (s == null) "…" else total.toString()
+        val timerState = if (running) "timer jalan" else if (s?.optBoolean("active") == true) "timer dijeda" else "timer belum jalan"
+        bubble.contentDescription = if (s == null) "Gelembung sharelink, belum siap" else "Gelembung sharelink, $total sharelink, $timerState"
         bubble.setTextColor(if (running) LIME else Color.WHITE)
         bubble.background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xF0183029.toInt(), 0xF0050D0B.toInt())
